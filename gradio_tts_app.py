@@ -120,10 +120,4 @@ with gr.Blocks() as demo:
     )
 
 if __name__ == "__main__":
-    # Use the right queue arg for your Gradio version
-    v = version.parse(gr.__version__)
-    if v >= version.parse("4.0.0"):
-        demo.queue(max_size=QUEUE_MAX_SIZE, concurrency_count=MAX_WORKERS).launch(share=True)
-    else:
-        # Older Gradio (pre-4.0) used default_concurrency_limit
-        demo.queue(max_size=QUEUE_MAX_SIZE, default_concurrency_limit=MAX_WORKERS).launch(share=True)
+    demo.queue(max_size=QUEUE_MAX_SIZE, default_concurrency_limit=MAX_WORKERS).launch(share=True)
