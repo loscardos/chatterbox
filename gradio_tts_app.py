@@ -12,7 +12,7 @@ from chatterbox.tts import ChatterboxTTS
 # --------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # How many generations can run *at the same time* on the model
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
 QUEUE_MAX_SIZE = int(os.getenv("QUEUE_MAX_SIZE", "128"))
 
 # --------------------
