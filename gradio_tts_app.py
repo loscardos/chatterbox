@@ -23,10 +23,11 @@ log = logging.getLogger("chatterbox-tts")
 # --------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Optional hard caps / queue size via env
+# Env knobs
 QUEUE_MAX_SIZE = int(os.getenv("QUEUE_MAX_SIZE", "128"))
-MAX_WORKERS_CAP = int(os.getenv("MAX_WORKERS_CAP", "16"))  # hard ceiling
-SAFETY_MARGIN = float(os.getenv("VRAM_SAFETY_MARGIN", "0.90"))  # use 90% of free VRAM
+MAX_WORKERS_CAP = int(os.getenv("MAX_WORKERS_CAP", "16"))          # hard concurrency ceiling
+VRAM_SAFETY_MARGIN = float(os.getenv("VRAM_SAFETY_MARGIN", "0.90")) # use 90% of free VRAM
+INIT_WORKERS = int(os.getenv("INIT_WORKERS", "2"))                  # start >1 so first run isn't serialized
 
 # --------------------
 # Global state
@@ -34,17 +35,13 @@ SAFETY_MARGIN = float(os.getenv("VRAM_SAFETY_MARGIN", "0.90"))  # use 90% of fre
 _model = None
 _model_lock = threading.Lock()
 
-# Dynamic concurrency state
 _dynamic_lock = threading.Lock()
-_dynamic_workers = 1              # start conservative, expand after first measurement
+_dynamic_workers = max(1, INIT_WORKERS)
 _dynamic_initialized = False
 _job_counter = 0
 
-# We will increase this semaphore after we measure VRAM on first job
+# Semaphore gates actual GPU concurrency (Gradio may dispatch more, but they'll wait here)
 _gen_semaphore = threading.Semaphore(_dynamic_workers)
-
-# Gradio needs a number at startup; we’ll bump it later to match _dynamic_workers
-_default_concurrency_limit = _dynamic_workers
 
 # --------------------
 # Helpers
@@ -54,29 +51,18 @@ def human_mb(x_bytes: int) -> str:
 
 def torch_gpu_info():
     if not torch.cuda.is_available():
-        return {
-            "available": False,
-            "name": "CPU",
-            "total": 0,
-            "free": 0,
-        }
+        return {"available": False, "name": "CPU", "total": 0, "free": 0}
     idx = torch.cuda.current_device()
     props = torch.cuda.get_device_properties(idx)
     name = props.name
-    # mem_get_info: (free, total) in bytes
-    free_b, total_b = torch.cuda.mem_get_info()
-    return {
-        "available": True,
-        "name": name,
-        "total": total_b,
-        "free": free_b,
-    }
+    free_b, total_b = torch.cuda.mem_get_info()  # (free, total) in bytes
+    return {"available": True, "name": name, "total": total_b, "free": free_b}
 
 def update_dynamic_workers(peak_job_bytes: int):
     """
-    Called once (or first successful measurement) to scale concurrency.
+    After first successful measurement, scale concurrency based on measured per-job peak VRAM.
     """
-    global _dynamic_workers, _gen_semaphore, _default_concurrency_limit, _dynamic_initialized
+    global _dynamic_workers, _gen_semaphore, _dynamic_initialized
 
     if not torch.cuda.is_available():
         with _dynamic_lock:
@@ -87,46 +73,38 @@ def update_dynamic_workers(peak_job_bytes: int):
 
     info = torch_gpu_info()
     free_b = info["free"]
-    # Remove a small buffer for allocator fragmentation (~256MB)
+    # Keep buffer for fragmentation (256 MB)
     buffer_b = 256 * 1024 * 1024
-    usable_b = max(0, int(free_b * SAFETY_MARGIN) - buffer_b)
+    usable_b = max(0, int(free_b * VRAM_SAFETY_MARGIN) - buffer_b)
 
     if peak_job_bytes <= 0:
-        # Fallback if measurement failed; keep at 1
         with _dynamic_lock:
-            _dynamic_workers = 1
+            _dynamic_workers = max(1, _dynamic_workers)
             _dynamic_initialized = True
-        log.warning("Peak VRAM per job measurement invalid; keeping workers at 1.")
+        log.warning("Peak VRAM/job invalid; keeping workers at %d.", _dynamic_workers)
         return
 
-    # Compute potential workers
     computed = max(1, usable_b // peak_job_bytes)
     computed = int(min(computed, MAX_WORKERS_CAP))
 
-    if computed < 1:
-        computed = 1
-
     with _dynamic_lock:
         if computed > _dynamic_workers:
-            # Increase semaphore by the delta
             delta = computed - _dynamic_workers
             for _ in range(delta):
                 _gen_semaphore.release()
             _dynamic_workers = computed
-            _default_concurrency_limit = computed
-            _dynamic_initialized = True
+        _dynamic_initialized = True
 
-    total_b = info["total"]
     log.info(
         "Dynamic concurrency set: %d workers (GPU: %s | Total %s, Free %s | "
         "Usable ~%s | Peak/job %s | Safety %.0f%% | Cap %d)",
         _dynamic_workers,
         info["name"],
-        human_mb(total_b),
-        human_mb(free_b),
+        human_mb(info["total"]),
+        human_mb(info["free"]),
         human_mb(usable_b),
         human_mb(peak_job_bytes),
-        SAFETY_MARGIN * 100,
+        VRAM_SAFETY_MARGIN * 100,
         MAX_WORKERS_CAP,
     )
 
@@ -164,8 +142,6 @@ def _measure_peak_and_generate(model, *args, **kwargs):
     Returns (audio_sr, audio_np), peak_delta_bytes
     """
     peak_delta = 0
-
-    # For accurate measurement
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
@@ -177,7 +153,6 @@ def _measure_peak_and_generate(model, *args, **kwargs):
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-        # Some models increase "reserved" much more than "allocated"; take the larger delta
         after_alloc = torch.cuda.max_memory_allocated()
         after_resv  = torch.cuda.max_memory_reserved()
         delta_alloc = max(0, after_alloc - before_alloc)
@@ -191,52 +166,40 @@ def _measure_peak_and_generate(model, *args, **kwargs):
 def generate(text, audio_prompt_path, exaggeration, temperature, seed_num, cfgw, min_p, top_p, repetition_penalty):
     global _job_counter, _dynamic_initialized
 
-    # Assign a job id
     with _dynamic_lock:
         _job_counter += 1
         job_id = _job_counter
 
-    # Queue log
-    log.info("Job #%d queued. Current permits: %d", job_id, _gen_semaphore._value if hasattr(_gen_semaphore, "_value") else -1)
+    # Queue entry log
+    sem_value = getattr(_gen_semaphore, "_value", None)
+    log.info("Job #%d queued. Semaphore permits now: %s", job_id, str(sem_value))
 
     start_wait = time.time()
     with _gen_semaphore:
         waited = time.time() - start_wait
-
-        # Acquire log
         gpu = torch_gpu_info()
         log.info(
-            "Job #%d acquired permit after %.3fs. GPU: %s | Free %s / Total %s | Active workers ~%d",
-            job_id,
-            waited,
-            gpu["name"],
-            human_mb(gpu["free"]),
-            human_mb(gpu["total"]),
-            _dynamic_workers
+            "Job #%d acquired permit after %.3fs. GPU: %s | Free %s / Total %s | Workers ~%d",
+            job_id, waited, gpu["name"], human_mb(gpu["free"]), human_mb(gpu["total"]), _dynamic_workers
         )
 
         model = get_model()
-
         if seed_num and int(seed_num) != 0:
             set_seed(int(seed_num))
 
-        # First complete job: measure VRAM footprint, then scale concurrency
         if torch.cuda.is_available() and not _dynamic_initialized:
             (sr, audio), peak_b = _measure_peak_and_generate(
                 model,
                 text,
                 audio_prompt_path=audio_prompt_path,
-                exaggeration=exaggeration,
-                temperature=temperature,
-                cfg_weight=cfgw,
-                min_p=min_p,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
+                exaggeration=float(exaggeration),
+                temperature=float(temperature),
+                cfg_weight=float(cfgw),
+                min_p=float(min_p),
+                top_p=float(top_p),
+                repetition_penalty=float(repetition_penalty),
             )
-            log.info(
-                "Job #%d peak VRAM usage measured: %s",
-                job_id, human_mb(peak_b)
-            )
+            log.info("Job #%d measured peak VRAM/job: %s", job_id, human_mb(peak_b))
             update_dynamic_workers(peak_b)
         else:
             t0 = time.time()
@@ -244,29 +207,24 @@ def generate(text, audio_prompt_path, exaggeration, temperature, seed_num, cfgw,
                 wav = model.generate(
                     text,
                     audio_prompt_path=audio_prompt_path,
-                    exaggeration=exaggeration,
-                    temperature=temperature,
-                    cfg_weight=cfgw,
-                    min_p=min_p,
-                    top_p=top_p,
-                    repetition_penalty=repetition_penalty,
+                    exaggeration=float(exaggeration),
+                    temperature=float(temperature),
+                    cfg_weight=float(cfgw),
+                    min_p=float(min_p),
+                    top_p=float(top_p),
+                    repetition_penalty=float(repetition_penalty),
                 )
             sr = getattr(model, "sr", 22050)
             audio = wav.squeeze(0).numpy()
             log.info("Job #%d generation finished in %.3fs", job_id, time.time() - t0)
 
-        # Clean up CUDA cache between jobs to reduce fragmentation
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # Final log
         gpu_after = torch_gpu_info()
         log.info(
             "Job #%d done. GPU Free now %s / Total %s. Current workers ~%d",
-            job_id,
-            human_mb(gpu_after["free"]),
-            human_mb(gpu_after["total"]),
-            _dynamic_workers
+            job_id, human_mb(gpu_after["free"]), human_mb(gpu_after["total"]), _dynamic_workers
         )
 
         return (sr, audio)
@@ -311,13 +269,13 @@ with gr.Blocks() as demo:
         with gr.Column():
             audio_output = gr.Audio(label="Output Audio")
 
-    # Pre-warm: show GPU info at UI load (non-blocking)
+    # Startup log (non-blocking)
     def _startup_log():
         info = torch_gpu_info()
         if info["available"]:
             log.info(
-                "Startup GPU: %s | Total %s, Free %s. Initial workers = %d (will auto-scale after first job).",
-                info["name"], human_mb(info["total"]), human_mb(info["free"]), _dynamic_workers
+                "Startup GPU: %s | Total %s, Free %s. INIT_WORKERS=%d (auto-scale after first job). Cap=%d",
+                info["name"], human_mb(info["total"]), human_mb(info["free"]), _dynamic_workers, MAX_WORKERS_CAP
             )
         else:
             log.info("Startup: CPU mode. Workers = 1.")
@@ -327,24 +285,13 @@ with gr.Blocks() as demo:
 
     run_btn.click(
         fn=generate,
-        inputs=[
-            text,
-            ref_wav,
-            exaggeration,
-            temp,
-            seed_num,
-            cfg_weight,
-            min_p,
-            top_p,
-            repetition_penalty,
-        ],
+        inputs=[text, ref_wav, exaggeration, temp, seed_num, cfg_weight, min_p, top_p, repetition_penalty],
         outputs=audio_output,
     )
 
 if __name__ == "__main__":
-    # Note: default_concurrency_limit is set to 1 now; after first run we expand the semaphore,
-    # and Gradio will still queue safely behind our semaphore gating.
+    # IMPORTANT: Let Gradio dispatch many jobs; our semaphore enforces real GPU concurrency.
     demo.queue(
         max_size=QUEUE_MAX_SIZE,
-        default_concurrency_limit=_default_concurrency_limit
+        default_concurrency_limit=MAX_WORKERS_CAP
     ).launch(share=True)
